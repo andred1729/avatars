@@ -21,6 +21,8 @@ import tempfile
 
 import requests
 
+import whiteboard
+
 # ---------------------------------------------------------------------------
 # Registry plumbing
 # ---------------------------------------------------------------------------
@@ -336,6 +338,12 @@ def write(
     return payload
 
 
+def whiteboard_clear() -> Dict[str, Any]:
+    """Clear all whiteboard content."""
+
+    return whiteboard.clear_board()
+
+
 # Register speech() so the LLM can call it.
 register_function(
     RegisteredFunction(
@@ -424,5 +432,31 @@ register_function(
             },
         },
         implementation=write,
+    )
+)
+
+
+register_function(
+    RegisteredFunction(
+        name="whiteboard_clear",
+        schema={
+            "name": "whiteboard_clear",
+            "description": "Erase all content from the shared whiteboard.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+        implementation=whiteboard_clear,
+    )
+)
+
+
+register_function(
+    RegisteredFunction(
+        name="whiteboard_get_state",
+        schema={
+            "name": "whiteboard_get_state",
+            "description": "Fetch the current whiteboard strokes and version.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+        implementation=lambda: whiteboard.get_state(),
     )
 )

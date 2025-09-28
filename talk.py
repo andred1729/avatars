@@ -279,28 +279,26 @@ def _prepare_submission_text(
 ) -> str:
     submission = user_prompt.strip()
     last_output = memory.last_improved_code()
-    note_lines: List[str] = []
 
-    if last_output and submission and submission == last_output.strip():
-        note_lines.append(
-            "Note: Submission matches your previous Output. Treat it as reference unless new requests appear."
+    duplicate_of_output = bool(
+        last_output and submission and submission == last_output.strip()
+    )
+
+    sections: List[str] = []
+    if submission:
+        sections.append(f"Submission:\n{submission}")
+    else:
+        sections.append("Submission is empty; relying on visual context only.")
+
+    if duplicate_of_output:
+        sections.append(
+            "Reminder: Submission matches your previous Output—reuse or refine it rather than repeating the same response."
         )
-        submission = ""
 
     if snapshot_descriptor:
-        note_lines.append(snapshot_descriptor)
+        sections.append(snapshot_descriptor)
 
-    if submission:
-        if note_lines:
-            note_lines.insert(0, f"Submission:\n{submission}")
-        else:
-            note_lines.append(f"Submission:\n{submission}")
-    elif note_lines:
-        pass
-    else:
-        note_lines.append("Submission is empty; relying on visual context only.")
-
-    return "\n\n".join(note_lines).strip()
+    return "\n\n".join(sections).strip()
 
 
 def _extract_python_script(response_text: str) -> Optional[str]:
