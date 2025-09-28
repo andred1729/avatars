@@ -1,8 +1,12 @@
 from pathlib import Path
 import os
 import json
-from typing import Any, Dict
-from fastapi import Body, FastAPI, Form, Request
+import tempfile
+from datetime import datetime
+from io import BytesIO
+from typing import Any, Dict, Optional, Mapping, Tuple
+
+from fastapi import Body, FastAPI, Form, Request, UploadFile, File, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from talk import talk
@@ -16,6 +20,126 @@ app = FastAPI(title="Code Submission App")
 
 BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+
+LOCALHOST_IMAGE_DIR = Path(
+    os.getenv("LOCALHOST_IMAGE_DIR", str(BASE_DIR / "runtime" / "views"))
+)
+LOCALHOST_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _transcribe_audio_file(audio_path: Path) -> Tuple[str, Optional[Dict[str, Any]]]:
+    elevenlabs_key = os.getenv("ELEVENLABS_API_KEY")
+    if elevenlabs_key:
+        model_id = os.getenv("ELEVENLABS_TRANSCRIBE_MODEL", "scribe_v1") or "scribe_v1"
+        language = os.getenv("ELEVENLABS_TRANSCRIBE_LANGUAGE")
+        tag_events = _env_flag("ELEVENLABS_TRANSCRIBE_TAG_EVENTS")
+        diarize = _env_flag("ELEVENLABS_TRANSCRIBE_DIARIZE")
+
+        try:
+            from elevenlabs.client import ElevenLabs  # type: ignore
+        except ImportError as exc:  # pragma: no cover - optional dependency
+            raise RuntimeError(
+                "Install the 'elevenlabs' package to enable speech-to-text transcription."
+            ) from exc
+
+        client = ElevenLabs(api_key=elevenlabs_key)
+
+        audio_bytes = BytesIO(audio_path.read_bytes())
+        audio_bytes.seek(0)
+
+        kwargs: Dict[str, Any] = {
+            "file": audio_bytes,
+            "model_id": model_id,
+        }
+        if language:
+            kwargs["language_code"] = language
+        if tag_events:
+            kwargs["tag_audio_events"] = True
+        if diarize:
+            kwargs["diarize"] = True
+
+        try:
+            transcription = client.speech_to_text.convert(**kwargs)
+        except Exception as exc:  # pragma: no cover - external dependency
+            status_code = getattr(exc, "status_code", None)
+            if status_code == 401:
+                raise PermissionError("Invalid transcription API key") from exc
+            raise RuntimeError(f"ElevenLabs transcription failed: {exc}") from exc
+
+        if isinstance(transcription, Mapping):
+            payload = dict(transcription)
+            text = payload.get("text") or payload.get("transcription") or payload.get("transcript")
+        else:
+            payload = getattr(transcription, "model_dump", lambda: None)()
+            text = getattr(transcription, "text", None)
+            if text is None and isinstance(payload, dict):
+                text = payload.get("text") or payload.get("transcription") or payload.get("transcript")
+
+        if not text:
+            raise RuntimeError("Transcription response did not include text.")
+        return str(text).strip(), payload if isinstance(payload, dict) else None
+
+    # Fallback to OpenAI transcription if ElevenLabs key is not configured.
+    api_key = os.getenv("HERDORA_API_KEY") or os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise EnvironmentError(
+            "Set ELEVENLABS_API_KEY or (HERDORA_API_KEY / OPENAI_API_KEY) for audio transcription."
+        )
+
+    base_url = os.getenv("HERDORA_BASE_URL")
+    model = os.getenv("HERDORA_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")
+
+    try:
+        from openai import OpenAI  # type: ignore
+
+        client = OpenAI(api_key=api_key, base_url=base_url)
+        with audio_path.open("rb") as audio_file:
+            response = client.audio.transcriptions.create(model=model, file=audio_file)
+        text = getattr(response, "text", None)
+        if text is None and isinstance(response, Mapping):
+            text = response.get("text")
+        if not text:
+            raise RuntimeError("Transcription response did not include text.")
+        payload_dict: Optional[Dict[str, Any]] = None
+        if isinstance(response, Mapping):
+            payload_dict = dict(response)
+        else:
+            model_dump = getattr(response, "model_dump", None)
+            if callable(model_dump):
+                payload_dict = model_dump()
+
+        return str(text).strip(), payload_dict
+    except ImportError:
+        import openai  # type: ignore
+
+        openai.api_key = api_key
+        if base_url:
+            openai.api_base = base_url
+        with audio_path.open("rb") as audio_file:
+            response = openai.Audio.transcribe(model=model, file=audio_file)  # type: ignore[attr-defined]
+        text = response.get("text") if isinstance(response, dict) else getattr(response, "text", None)
+        if not text:
+            raise RuntimeError("Transcription response did not include text.")
+        payload_dict: Optional[Dict[str, Any]] = None
+        if isinstance(response, dict):
+            payload_dict = dict(response)
+        else:
+            model_dump = getattr(response, "model_dump", None)
+            if callable(model_dump):
+                payload_dict = model_dump()
+
+        return str(text).strip(), payload_dict
+    except Exception as exc:  # pragma: no cover - external dependency
+        if exc.__class__.__name__ == "AuthenticationError":
+            raise PermissionError("Invalid transcription API key") from exc
+        raise
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -97,3 +221,100 @@ async def whiteboard_send_endpoint(payload: Dict[str, Any] = Body(default=None))
     )
     talk_result = talk(request_text)
     return JSONResponse({"talk": talk_result, "whiteboard": board_state})
+
+
+@app.post("/submit/voice")
+async def submit_voice(
+    request: Request,
+    audio: UploadFile = File(...),
+    screenshot: Optional[UploadFile] = File(None),
+    code: str = Form(""),
+) -> JSONResponse:
+    if not os.getenv("HERDORA_API_KEY"):
+        raise HTTPException(status_code=400, detail="API key for Herdora must be set.")
+
+    if audio.content_type and not audio.content_type.startswith("audio"):
+        raise HTTPException(status_code=400, detail="Uploaded file is not recognized as audio.")
+
+    audio_suffix = Path(audio.filename or "recording.webm").suffix or ".webm"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=audio_suffix) as tmp_audio:
+        audio_path = Path(tmp_audio.name)
+        audio_bytes = await audio.read()
+        tmp_audio.write(audio_bytes)
+
+    if screenshot is not None:
+        screenshot_bytes = await screenshot.read()
+        if screenshot_bytes:
+            shot_suffix = Path(screenshot.filename or "capture.png").suffix or ".png"
+            timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S%fZ")
+            capture_path = LOCALHOST_IMAGE_DIR / f"voice_capture_{timestamp}{shot_suffix}"
+            capture_path.write_bytes(screenshot_bytes)
+
+    try:
+        transcript_text, transcript_payload = _transcribe_audio_file(audio_path)
+    except PermissionError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Audio transcription failed: invalid API key for transcription provider.",
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Audio transcription failed: {exc}") from exc
+    finally:
+        try:
+            audio_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    transcript_text = transcript_text.strip()
+    if not transcript_text:
+        raise HTTPException(status_code=400, detail="Transcription failed; empty transcript.")
+
+    code_text = (code or "").strip()
+
+    prompt_parts = []
+    if code_text:
+        prompt_parts.append(code_text)
+    if transcript_text:
+        prompt_parts.append(f"Voice notes:\n{transcript_text}")
+
+    combined_prompt = "\n\n".join(prompt_parts) if prompt_parts else transcript_text
+
+    talk_result = talk(combined_prompt)
+    improved_code = str(talk_result.get("improved_code", "")).strip()
+    if not improved_code:
+        improved_code = "No improved code was produced."
+
+    whiteboard_state = whiteboard.get_state()
+
+    response_payload: Dict[str, Any] = {
+        "transcript": transcript_text,
+        "talk": talk_result,
+        "result": improved_code,
+        "whiteboard": whiteboard_state,
+    }
+    if transcript_payload:
+        response_payload["transcription_details"] = transcript_payload
+
+    if transcript_payload:
+        try:
+            transcripts_dir = BASE_DIR / "runtime" / "transcripts"
+            transcripts_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S%fZ")
+            transcript_path = transcripts_dir / f"recording_{timestamp}.json"
+            transcript_path.write_text(
+                json.dumps(
+                    {
+                        "transcript": transcript_text,
+                        "metadata": transcript_payload,
+                        "code": code_text,
+                        "combined_prompt": combined_prompt,
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            response_payload["transcription_file"] = str(transcript_path)
+        except Exception as exc:  # pragma: no cover - best effort logging
+            response_payload["transcription_file_error"] = str(exc)
+
+    return JSONResponse(response_payload)
