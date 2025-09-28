@@ -27,11 +27,36 @@ LOCALHOST_IMAGE_DIR = Path(
 LOCALHOST_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 
 
+EXPLAIN_KEYWORDS = (
+    "explain",
+    "explanation",
+    "teach",
+    "teaching",
+    "tutorial",
+    "walk me through",
+    "help me understand",
+    "understand",
+    "break down",
+    "step by step",
+    "diagram",
+    "whiteboard",
+    "visualize",
+    "draw",
+    "illustrate",
+    "show me",
+)
+
+
 def _env_flag(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def should_open_whiteboard(prompt: str) -> bool:
+    normalized = (prompt or "").lower()
+    return any(keyword in normalized for keyword in EXPLAIN_KEYWORDS)
 
 
 def _transcribe_audio_file(audio_path: Path) -> Tuple[str, Optional[Dict[str, Any]]]:
@@ -154,6 +179,7 @@ async def read_form(request: Request) -> HTMLResponse:
             "code": "",
             "result": "",
             "whiteboard_state": json.dumps(whiteboard_state),
+            "auto_open_whiteboard": False,
         },
     )
 
@@ -179,6 +205,7 @@ async def submit_code(request: Request, code: str = Form(...)) -> HTMLResponse:
     if not improved_code:
         improved_code = "No improved code was produced."
     whiteboard_state = whiteboard.get_state()
+    auto_open = should_open_whiteboard(code)
     return templates.TemplateResponse(
         "index.html",
         {
@@ -187,6 +214,7 @@ async def submit_code(request: Request, code: str = Form(...)) -> HTMLResponse:
             "code": code,
             "result": improved_code,
             "whiteboard_state": json.dumps(whiteboard_state),
+            "auto_open_whiteboard": auto_open,
         },
     )
 
@@ -292,6 +320,10 @@ async def submit_voice(
         "result": improved_code,
         "whiteboard": whiteboard_state,
     }
+    if should_open_whiteboard(combined_prompt):
+        response_payload["whiteboard_action"] = "open"
+    else:
+        response_payload["whiteboard_action"] = "close"
     if transcript_payload:
         response_payload["transcription_details"] = transcript_payload
 

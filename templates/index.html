@@ -263,6 +263,7 @@
       <div class="whiteboard-spinner" id="whiteboard-spinner" aria-hidden="true"></div>
     </div>
     <script type="application/json" id="whiteboard-data">{{ whiteboard_state if whiteboard_state else '{}' }}</script>
+    <script type="application/json" id="whiteboard-auto-flag">{{ 'true' if auto_open_whiteboard else 'false' }}</script>
     <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js" integrity="sha256-dGkEAjWz0nN7kYMva9n32CuWHa3gwxObn2ymlk/wr9g=" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
     <script>
       const form = document.getElementById('code-form');
@@ -278,6 +279,7 @@
       const whiteboardCloseBtn = document.getElementById('whiteboard-close');
       const whiteboardSpinner = document.getElementById('whiteboard-spinner');
       const whiteboardStateEl = document.getElementById('whiteboard-data');
+      const whiteboardAutoFlagEl = document.getElementById('whiteboard-auto-flag');
 
       let whiteboardState = { strokes: [] };
       try {
@@ -286,12 +288,21 @@
         whiteboardState = { strokes: [] };
       }
 
+      let initialAutoOpenWhiteboard = false;
+      try {
+        initialAutoOpenWhiteboard = JSON.parse(whiteboardAutoFlagEl.textContent || 'false');
+      } catch (error) {
+        initialAutoOpenWhiteboard = false;
+      }
+
       let recordingStream = null;
       let mediaRecorder = null;
       let audioChunks = [];
       let isRecordingVoice = false;
       let isProcessingVoice = false;
       const VOICE_KEY_CODE = 'KeyV';
+      let autoWhiteboardTimer = null;
+      let autoWhiteboardActive = false;
 
       let whiteboardActive = false;
       let currentTool = 'draw';
@@ -323,12 +334,47 @@
         }
         if (!whiteboardActive) {
           setSpinnerVisible(false);
+          if (autoWhiteboardTimer) {
+            clearTimeout(autoWhiteboardTimer);
+            autoWhiteboardTimer = null;
+          }
+          autoWhiteboardActive = false;
         }
       }
 
       function setSpinnerVisible(visible) {
         whiteboardSpinner.classList.toggle('active', visible);
         whiteboardSendBtn.disabled = Boolean(visible);
+      }
+
+      function scheduleAutoCloseWhiteboard() {
+        if (autoWhiteboardTimer) {
+          clearTimeout(autoWhiteboardTimer);
+        }
+        autoWhiteboardTimer = setTimeout(() => {
+          if (autoWhiteboardActive) {
+            toggleWhiteboard(false);
+            autoWhiteboardActive = false;
+            autoWhiteboardTimer = null;
+          }
+        }, 15000);
+      }
+
+      function autoOpenWhiteboard() {
+        toggleWhiteboard(true);
+        autoWhiteboardActive = true;
+        scheduleAutoCloseWhiteboard();
+      }
+
+      function autoCloseWhiteboard() {
+        if (autoWhiteboardTimer) {
+          clearTimeout(autoWhiteboardTimer);
+          autoWhiteboardTimer = null;
+        }
+        if (autoWhiteboardActive && whiteboardActive) {
+          toggleWhiteboard(false);
+        }
+        autoWhiteboardActive = false;
       }
 
       function setTool(tool) {
@@ -463,6 +509,12 @@
             }
           }
 
+          if (payload.whiteboard_action === 'open') {
+            autoOpenWhiteboard();
+          } else if (payload.whiteboard_action === 'close') {
+            autoCloseWhiteboard();
+          }
+
           if (payload.result) {
             outputTextarea.value = payload.result;
           } else if (payload.talk && payload.talk.text) {
@@ -476,6 +528,7 @@
           console.error('Voice submission error:', error);
           setVoiceStatus('Voice submission failed. Press Shift+V to try again (see console for details).');
           outputTextarea.value = 'Voice submission failed. Check console for details.';
+          autoCloseWhiteboard();
         } finally {
           isProcessingVoice = false;
           mediaRecorder = null;
@@ -729,6 +782,9 @@
 
       setTool('draw');
       renderWhiteboard();
+      if (initialAutoOpenWhiteboard) {
+        autoOpenWhiteboard();
+      }
       setVoiceStatus('Press Shift+V to start recording; press again to stop and submit.');
 
       form.addEventListener('submit', (event) => {
