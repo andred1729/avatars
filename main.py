@@ -210,6 +210,8 @@ async def submit_code(request: Request, code: str = Form(...)) -> HTMLResponse:
         improved_code = "No improved code was produced."
     if explanation_mode:
         improved_code = ""
+    elif improved_code == "No improved code was produced.":
+        improved_code = ""
     whiteboard_state = whiteboard.get_state()
     return templates.TemplateResponse(
         "index.html",
@@ -315,19 +317,21 @@ async def submit_voice(
 
     talk_result = talk(combined_prompt)
     improved_code = str(talk_result.get("improved_code", "")).strip()
-    if not improved_code:
-        improved_code = "No improved code was produced."
+    if not improved_code or improved_code == "No improved code was produced.":
+        improved_code = ""
     if explanation_mode:
         improved_code = ""
 
     whiteboard_state = whiteboard.get_state()
+
+    suppress_output = explanation_mode or not improved_code
 
     response_payload: Dict[str, Any] = {
         "transcript": transcript_text,
         "talk": talk_result,
         "whiteboard": whiteboard_state,
         "result": improved_code,
-        "suppress_output": explanation_mode,
+        "suppress_output": suppress_output,
     }
     response_payload["whiteboard_action"] = "open" if explanation_mode else "close"
     if transcript_payload:
