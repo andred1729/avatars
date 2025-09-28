@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
 from llm_functions import call_registered_function, function_schemas
+from write import write as rewrite_code
 
 SYSTEM_PROMPT_PATH = Path(__file__).resolve().parents[0] / "prompts" / "avatar_system_prompt.txt"
 DEFAULT_USER_PROMPT = (
@@ -264,6 +265,46 @@ def _extract_speech_kwargs(script: str) -> Optional[Dict[str, Any]]:
             return call_kwargs
 
     return None
+
+
+def _normalize_improved_code(candidate: str) -> str:
+    """Strip markdown fences, surrounding quotes, and escaped newlines."""
+
+    text = (candidate or "").strip()
+    if not text:
+        return ""
+
+    block_match = _CODE_BLOCK_PATTERN.search(text)
+    if block_match:
+        text = block_match.group(1).strip()
+
+    if text[:3] in {'"""', "'''"} and text[-3:] == text[:3]:
+        text = text[3:-3]
+    elif text.startswith(('"', "'")) and text.endswith(('"', "'")) and len(text) >= 2:
+        try:
+            text = ast.literal_eval(text)
+        except (SyntaxError, ValueError):
+            text = text[1:-1]
+
+    text = text.replace("\\r\n", "\n").replace("\\n", "\n").replace("\r\n", "\n")
+    return text.strip()
+
+
+def _extract_improved_from_actions(actions: Optional[List[Dict[str, Any]]]) -> str:
+    if not actions:
+        return ""
+    for action in reversed(actions):
+        if action.get("name") != "write":
+            continue
+        for container_key in ("arguments", "result"):
+            container = action.get(container_key)
+            if isinstance(container, Mapping):
+                raw_code = container.get("improved_code") or container.get("text")
+                if isinstance(raw_code, str):
+                    normalized = _normalize_improved_code(raw_code)
+                    if normalized:
+                        return normalized
+    return ""
 
 
 def _build_messages(user_prompt: str, memory_messages: List[Dict[str, str]]) -> List[Dict[str, Any]]:
@@ -538,8 +579,31 @@ def talk(user_prompt: str = DEFAULT_USER_PROMPT) -> Dict[str, Any]:
 
     _CONVERSATION_MEMORY.record_turn(user_prompt, final_text)
 
-    return {
+    improved_code: str = ""
+    rewrite_payload: Optional[Dict[str, Any]] = None
+    rewrite_error: Optional[str] = None
+    try:
+        rewrite_payload = rewrite_code(user_prompt)
+        if isinstance(rewrite_payload, Mapping):
+            primary_candidate = rewrite_payload.get("text")
+            if isinstance(primary_candidate, str):
+                improved_code = _normalize_improved_code(primary_candidate)
+            if not improved_code:
+                improved_code = _extract_improved_from_actions(rewrite_payload.get("actions"))
+    except Exception as exc:  # pragma: no cover - defensive guard
+        rewrite_error = str(exc)
+
+    response: Dict[str, Any] = {
         "text": final_text,
+        "speech": final_text,
         "actions": actions,
         "assistant_message": assistant_message,
+        "improved_code": improved_code,
     }
+
+    if rewrite_payload is not None:
+        response["rewrite"] = rewrite_payload
+    if rewrite_error is not None:
+        response["rewrite_error"] = rewrite_error
+
+    return response
