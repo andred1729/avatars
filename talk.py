@@ -62,6 +62,8 @@ def _request_herdora_completion(messages: list[dict[str, str]]) -> str:
         return (response["choices"][0]["message"]["content"] or "").strip()
 
 
+from llm_functions import speak
+
 def talk(
     user_prompt: str = DEFAULT_USER_PROMPT,
 ) -> Dict[str, object]:
@@ -71,6 +73,8 @@ def talk(
     script = _request_herdora_completion(messages)
     if not script:
         raise RuntimeError("Herdora returned an empty reply for Herdora's script.")
+
+    speak(script)
 
     return {
         "text": script,
