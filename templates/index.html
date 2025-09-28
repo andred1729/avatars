@@ -138,7 +138,7 @@
     <div class="container">
       <div class="left-div">
         <h1>Code Submission</h1>
-        <form action="/submit" method="post">
+        <form id="code-form" action="/submit" method="post">
           <label for="code" class="sr-only">Paste your code snippet</label>
           <textarea
             id="code"
@@ -146,16 +146,9 @@
             class="styled-textarea"
             placeholder="Paste your code snippet here"
             required
-          ></textarea>
+          >{{ code if code else '' }}</textarea>
           <button type="submit">Submit</button>
         </form>
-
-        {% if submitted %}
-        <section class="result">
-          <h2>Submitted Code</h2>
-          <pre>{{ code | e }}</pre>
-        </section>
-        {% endif %}
 
         {% if error %}
         <section class="result error">
@@ -175,5 +168,49 @@
         >{% if result %}{{ result }}{% endif %}</textarea>
       </div>
     </div>
+    <script>
+      const form = document.getElementById('code-form');
+      const outputTextarea = document.getElementById('output');
+
+      form.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        
+        const formData = new FormData(form);
+        const code = formData.get('code');
+        
+        outputTextarea.value = 'Processing...';
+
+        try {
+          const response = await fetch('/submit', {
+            method: 'POST',
+            body: new URLSearchParams({ code }),
+            headers: {
+              'Content-Type': 'application/x-www-form-urlencoded',
+            },
+          });
+
+          if (response.ok) {
+            const htmlText = await response.text();
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(htmlText, 'text/html');
+            const newOutput = doc.getElementById('output');
+            const newError = doc.querySelector('.result.error pre');
+
+            if (newError) {
+                outputTextarea.value = newError.textContent;
+            } else if (newOutput) {
+                outputTextarea.value = newOutput.textContent;
+            } else {
+                outputTextarea.value = 'Could not find output in response.';
+            }
+          } else {
+            outputTextarea.value = `Error: ${response.status} ${response.statusText}`;
+          }
+        } catch (error) {
+          console.error('Submission error:', error);
+          outputTextarea.value = 'An unexpected error occurred.';
+        }
+      });
+    </script>
   </body>
 </html>
