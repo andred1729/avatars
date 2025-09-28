@@ -71,8 +71,11 @@ def call_registered_function(name: str, arguments: Mapping[str, Any]) -> Dict[st
 # ---------------------------------------------------------------------------
 
 
-_AUDIO_OUTPUT_DIR = Path(__file__).resolve().parent / "runtime" / "audio"
+_RUNTIME_ROOT = Path(__file__).resolve().parent / "runtime"
+_AUDIO_OUTPUT_DIR = _RUNTIME_ROOT / "audio"
 _AUDIO_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+_WRITE_OUTPUT_DIR = _RUNTIME_ROOT / "writes"
+_WRITE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _build_voice_settings(
@@ -212,6 +215,112 @@ def speech(
     }
 
 
+# ---------------------------------------------------------------------------
+# write(...) implementation
+# ---------------------------------------------------------------------------
+
+
+_LANGUAGE_EXTENSION_HINTS: Dict[str, str] = {
+    "py": ".py",
+    "python": ".py",
+    "js": ".js",
+    "javascript": ".js",
+    "ts": ".ts",
+    "typescript": ".ts",
+    "java": ".java",
+    "cs": ".cs",
+    "csharp": ".cs",
+    "rb": ".rb",
+    "ruby": ".rb",
+    "go": ".go",
+    "rs": ".rs",
+    "rust": ".rs",
+    "php": ".php",
+    "swift": ".swift",
+    "kt": ".kt",
+    "kotlin": ".kt",
+    "c": ".c",
+    "h": ".h",
+    "cpp": ".cpp",
+    "c++": ".cpp",
+    "hpp": ".hpp",
+    "html": ".html",
+    "css": ".css",
+    "json": ".json",
+    "xml": ".xml",
+    "yaml": ".yaml",
+    "yml": ".yml",
+    "sql": ".sql",
+}
+
+
+def _sanitize_filename(candidate: str) -> str:
+    """Restrict filenames to the writes/ directory and strip suspicious bits."""
+
+    name = Path(candidate).name  # Drop directory components.
+    if name in {"", ".", ".."}:
+        return ""
+    # Replace whitespace with underscores and drop characters that could confuse filesystems.
+    sanitized = "".join(char if char.isalnum() or char in {"_", "-", "."} else "_" for char in name)
+    # Prevent consecutive dots that could traverse upwards.
+    while ".." in sanitized:
+        sanitized = sanitized.replace("..", "_")
+    return sanitized.strip("._")
+
+
+def write(
+    *,
+    improved_code: str,
+    analysis: str | None = None,
+    language: str | None = None,
+    filename: str | None = None,
+) -> Dict[str, Any]:
+    """Persist an improved code variant emitted by the LLM."""
+
+    normalized_code = (improved_code or "").rstrip()
+    if not normalized_code:
+        raise ValueError("write() requires non-empty improved_code text.")
+
+    extension = ".txt"
+    if filename:
+        sanitized_name = _sanitize_filename(filename)
+    else:
+        sanitized_name = ""
+
+    if sanitized_name and Path(sanitized_name).suffix:
+        extension = Path(sanitized_name).suffix
+    elif language:
+        lookup_key = language.lower().strip()
+        extension = _LANGUAGE_EXTENSION_HINTS.get(lookup_key, extension)
+
+    if not sanitized_name:
+        timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S%fZ")
+        sanitized_name = f"rewrite_{timestamp}{extension}"
+    elif not sanitized_name.endswith(extension):
+        sanitized_name = f"{sanitized_name}{extension}"
+
+    output_path = _WRITE_OUTPUT_DIR / sanitized_name
+
+    # Ensure we don't overwrite an existing artifact; append a timestamp if needed.
+    if output_path.exists():
+        timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S%fZ")
+        output_path = output_path.with_name(f"{output_path.stem}_{timestamp}{output_path.suffix}")
+
+    output_path.write_text(f"{normalized_code}\n", encoding="utf-8")
+
+    payload: Dict[str, Any] = {
+        "type": "write",
+        "improved_code": normalized_code,
+        "artifact_path": str(output_path),
+    }
+    if analysis:
+        payload["analysis"] = analysis.strip()
+    if language:
+        payload["language"] = language.lower().strip()
+
+    return payload
+
+
 # Register speech() so the LLM can call it.
 register_function(
     RegisteredFunction(
@@ -261,5 +370,44 @@ register_function(
             },
         },
         implementation=speech,
+    )
+)
+
+
+# Register write() so the LLM can return improved code artifacts.
+register_function(
+    RegisteredFunction(
+        name="write",
+        schema={
+            "name": "write",
+            "description": (
+                "Store an improved version of the user's code and optionally include analysis metadata."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "improved_code": {
+                        "type": "string",
+                        "description": "The refined code to surface back to the user.",
+                    },
+                    "analysis": {
+                        "type": "string",
+                        "description": "Optional commentary explaining the improvements.",
+                    },
+                    "language": {
+                        "type": "string",
+                        "description": "Hint for the language so extensions can be derived.",
+                    },
+                    "filename": {
+                        "type": "string",
+                        "description": (
+                            "Optional filename suggestion (no directories). An extension will be appended if missing."
+                        ),
+                    },
+                },
+                "required": ["improved_code"],
+            },
+        },
+        implementation=write,
     )
 )

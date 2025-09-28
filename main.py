@@ -19,13 +19,13 @@ async def read_form(request: Request) -> HTMLResponse:
     """Render the code submission form."""
     return templates.TemplateResponse(
         "index.html",
-        {"request": request, "submitted": False, "code": ""},
+        {"request": request, "submitted": False, "code": "", "result": ""},
     )
 
 
 @app.post("/submit", response_class=HTMLResponse)
 async def submit_code(request: Request, code: str = Form(...)) -> HTMLResponse:
-    """Display the submitted code back to the user."""
+    """Trigger Herdora's critique and return the improved code."""
     if not os.getenv("HERDORA_API_KEY"):
         return templates.TemplateResponse(
             "index.html",
@@ -36,8 +36,17 @@ async def submit_code(request: Request, code: str = Form(...)) -> HTMLResponse:
                 "error": "API key for Herdora must be set.",
             },
         )
-    result = talk(code)
+    talk_result = talk(code)
+
+    improved_code = str(talk_result.get("improved_code", "")).strip()
+    if not improved_code:
+        improved_code = "No improved code was produced."
     return templates.TemplateResponse(
         "index.html",
-        {"request": request, "submitted": True, "code": code, "result": result["text"]},
+        {
+            "request": request,
+            "submitted": True,
+            "code": code,
+            "result": improved_code,
+        },
     )

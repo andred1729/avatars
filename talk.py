@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import ast
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 from llm_functions import call_registered_function, function_schemas
+from write import write as rewrite_code
 
 SYSTEM_PROMPT_PATH = Path(__file__).resolve().parents[0] / "prompts" / "avatar_system_prompt.txt"
 DEFAULT_USER_PROMPT = (
@@ -140,6 +142,46 @@ def _extract_executable_code(raw_text: str) -> tuple[Optional[str], bool]:
         return None, found_code_block
 
     return candidate, found_code_block
+
+
+def _normalize_improved_code(candidate: str) -> str:
+    """Strip markdown fences, surrounding quotes, and escaped newlines."""
+
+    text = (candidate or "").strip()
+    if not text:
+        return ""
+
+    block_match = _CODE_BLOCK_PATTERN.search(text)
+    if block_match:
+        text = block_match.group(1).strip()
+
+    if text[:3] in {'"""', "'''"} and text[-3:] == text[:3]:
+        text = text[3:-3]
+    elif text.startswith(('"', "'")) and text.endswith(('"', "'")) and len(text) >= 2:
+        try:
+            text = ast.literal_eval(text)
+        except (SyntaxError, ValueError):
+            text = text[1:-1]
+
+    text = text.replace("\\r\n", "\n").replace("\\n", "\n").replace("\r\n", "\n")
+    return text.strip()
+
+
+def _extract_improved_from_actions(actions: Optional[List[Dict[str, Any]]]) -> str:
+    if not actions:
+        return ""
+    for action in reversed(actions):
+        if action.get("name") != "write":
+            continue
+        for container_key in ("arguments", "result"):
+            container = action.get(container_key)
+            if isinstance(container, Mapping):
+                raw_code = container.get("improved_code") or container.get("text")
+                if isinstance(raw_code, str):
+                    normalized = _normalize_improved_code(raw_code)
+                    if normalized:
+                        return normalized
+    return ""
 
 
 def _format_speech_invocation(arguments: Mapping[str, Any]) -> str:
@@ -401,51 +443,74 @@ def talk(
 
     code_snippet, had_code_block = _extract_executable_code(final_text)
     fallback_reason: Optional[str] = None
+    final_speech_script: Optional[str] = None
 
     if code_snippet:
         if _execute_generated_code(code_snippet, actions):
-            return {
-                "text": code_snippet,
-                "actions": actions,
+            final_speech_script = code_snippet
+        else:
+            fallback_reason = "Generated script executed without invoking speech."
+
+    if final_speech_script is None:
+        if had_code_block and not code_snippet:
+            raise RuntimeError("Generated code block was not runnable.")
+
+        normalized_text = _normalize_script(final_text)
+        if not normalized_text:
+            normalized_text = "Herdora had nothing to add beyond snarling into the void."
+
+        existing_speech = next((action for action in actions if action.get("name") == "speech"), None)
+        if existing_speech:
+            final_speech_script = _format_speech_invocation(existing_speech["arguments"])
+        else:
+            fallback_text = normalized_text
+            if fallback_reason:
+                summary = normalized_text or "I wound up speechless."
+                fallback_text = (
+                    f"*sighs wearily* {fallback_reason} So here's a begrudging recap: {summary}"
+                )
+            if not fallback_text.startswith("*"):
+                fallback_text = f"*sighs wearily* {fallback_text}"
+            fallback_text = _normalize_script(fallback_text)
+            if not fallback_text:
+                fallback_text = "*sighs wearily* I wound up speechless."
+
+            fallback_arguments: Dict[str, Any] = {
+                "text": fallback_text,
+                "stability": 0.25,
+                "similarity_boost": 0.6,
             }
-        fallback_reason = "Generated script executed without invoking speech."
+            fallback_script = _format_speech_invocation(fallback_arguments)
+            _execute_generated_code(fallback_script, actions)
+            final_speech_script = fallback_script
 
-    if had_code_block and not code_snippet:
-        raise RuntimeError("Generated code block was not runnable.")
+    if final_speech_script is None:
+        raise RuntimeError("Failed to generate a speech script.")
 
-    normalized_text = _normalize_script(final_text)
-    if not normalized_text:
-        normalized_text = "Herdora had nothing to add beyond snarling into the void."
+    improved_code: str = ""
+    rewrite_payload: Optional[Dict[str, Any]] = None
+    rewrite_error: Optional[str] = None
+    try:
+        rewrite_payload = rewrite_code(user_prompt)
+        if isinstance(rewrite_payload, Mapping):
+            primary_candidate = rewrite_payload.get("text")
+            if isinstance(primary_candidate, str):
+                improved_code = _normalize_improved_code(primary_candidate)
+            if not improved_code:
+                improved_code = _extract_improved_from_actions(rewrite_payload.get("actions"))
+    except Exception as exc:  # pragma: no cover - defensive guard
+        rewrite_error = str(exc)
 
-    existing_speech = next((action for action in actions if action.get("name") == "speech"), None)
-    if existing_speech:
-        rendered_script = _format_speech_invocation(existing_speech["arguments"])
-        return {
-            "text": rendered_script,
-            "actions": actions,
-        }
-
-    fallback_text = normalized_text
-    if fallback_reason:
-        summary = normalized_text or "I wound up speechless."
-        fallback_text = (
-            f"*sighs wearily* {fallback_reason} So here's a begrudging recap: {summary}"
-        )
-    if not fallback_text.startswith("*"):
-        fallback_text = f"*sighs wearily* {fallback_text}"
-    fallback_text = _normalize_script(fallback_text)
-    if not fallback_text:
-        fallback_text = "*sighs wearily* I wound up speechless."
-
-    fallback_arguments: Dict[str, Any] = {
-        "text": fallback_text,
-        "stability": 0.25,
-        "similarity_boost": 0.6,
-    }
-    fallback_script = _format_speech_invocation(fallback_arguments)
-    _execute_generated_code(fallback_script, actions)
-
-    return {
-        "text": fallback_script,
+    response: Dict[str, Any] = {
+        "text": final_speech_script,
+        "speech": final_speech_script,
         "actions": actions,
+        "improved_code": improved_code,
     }
+
+    if rewrite_payload is not None:
+        response["rewrite"] = rewrite_payload
+    if rewrite_error is not None:
+        response["rewrite_error"] = rewrite_error
+
+    return response
