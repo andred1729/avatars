@@ -11,7 +11,7 @@ from typing import Dict, Optional
 
 import requests
 
-SYSTEM_PROMPT_PATH = Path(__file__).resolve().parents[1] / "prompts" / "avatar_system_prompt.txt"
+SYSTEM_PROMPT_PATH = Path(__file__).resolve().parents[0] / "prompts" / "avatar_system_prompt.txt"
 DEFAULT_USER_PROMPT = (
     "Share your bleakest assessment of the current code, then begrudgingly offer to help."
 )
