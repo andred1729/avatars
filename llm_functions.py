@@ -8,6 +8,7 @@ capabilities can be layered in safely over time (e.g. Tavus video synthesis).
 
 from __future__ import annotations
 
+import atexit
 import os
 import subprocess
 import sys
@@ -15,6 +16,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping
+
+import tempfile
 
 import requests
 
@@ -71,8 +74,19 @@ def call_registered_function(name: str, arguments: Mapping[str, Any]) -> Dict[st
 # ---------------------------------------------------------------------------
 
 
-_AUDIO_OUTPUT_DIR = Path(__file__).resolve().parent / "runtime" / "audio"
-_AUDIO_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+_TEMP_AUDIO_DIR = tempfile.TemporaryDirectory(prefix="herdora_audio_")
+_AUDIO_OUTPUT_DIR = Path(_TEMP_AUDIO_DIR.name)
+
+
+@atexit.register
+def _cleanup_temp_audio_dir() -> None:
+    """Ensure temporary audio artifacts are removed when the process exits."""
+
+    try:
+        _TEMP_AUDIO_DIR.cleanup()
+    except Exception:
+        # Avoid masking the shutdown sequence if cleanup fails for any reason.
+        pass
 
 
 def _build_voice_settings(

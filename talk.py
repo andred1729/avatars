@@ -1,12 +1,15 @@
-"""Herdora speech pipeline with function-calling support."""
+"""Herdora speech pipeline with simplified function calling and lightweight memory."""
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
+import textwrap
+import threading
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 from llm_functions import call_registered_function, function_schemas
 
@@ -14,6 +17,7 @@ SYSTEM_PROMPT_PATH = Path(__file__).resolve().parents[0] / "prompts" / "avatar_s
 DEFAULT_USER_PROMPT = (
     "Share your bleakest assessment of the current code, then begrudgingly offer to help."
 )
+_MAX_TOOL_ITERATIONS = 8
 
 
 def _load_system_prompt() -> str:
@@ -25,22 +29,25 @@ def _load_system_prompt() -> str:
         ) from exc
 
 
-def _build_messages(user_prompt: str) -> List[Dict[str, Any]]:
-    persona = _load_system_prompt()
-    system_content = (
-        f"{persona}\n\n"
-        "Stay focused on code critique and deliver a single spoken reply Herdora can voice. "
-        "Keep it under three sentences, weave in vocal cues like *sighs* or *mutters*, and end with "
-        "a begrudging offer to assist."
-    )
-    return [
-        {"role": "system", "content": system_content},
-        {"role": "user", "content": user_prompt},
-    ]
+def _describe_registered_functions() -> str:
+    """Render a human-friendly summary of the function registry."""
+
+    descriptions: List[str] = []
+    for schema in function_schemas():
+        name = str(schema.get("name", "unknown"))
+        description = str(schema.get("description", "")).strip()
+        parameters = schema.get("parameters", {}) if isinstance(schema, Mapping) else {}
+        properties = parameters.get("properties", {}) if isinstance(parameters, Mapping) else {}
+        param_list = ", ".join(properties.keys()) if properties else ""
+        if param_list:
+            descriptions.append(f"- {name}({param_list}) — {description}")
+        else:
+            descriptions.append(f"- {name} — {description}")
+    return "\n".join(descriptions)
 
 
 _STAGE_DIRECTION_PATTERN = re.compile(r"\*(.*?)\*")
-_CODE_BLOCK_PATTERN = re.compile(r"```(?:[a-zA-Z0-9_+\-]+)?\s*(.*?)```", re.DOTALL)
+_CODE_BLOCK_PATTERN = re.compile(r"```(?:python)?\s*(.*?)```", re.DOTALL)
 
 
 _AUDIO_TAG_ALIASES: Dict[str, str] = {
@@ -85,6 +92,70 @@ _AUDIO_TAG_ALIASES: Dict[str, str] = {
 }
 
 
+class ConversationMemory:
+    """Tracks recent dialogue and a rolling summary for the local session."""
+
+    def __init__(self, *, max_turns: int = 20) -> None:
+        self._max_turns = max_turns
+        self._turns: List[tuple[str, str]] = []
+        self._summary: Optional[str] = None
+        self._lock = threading.Lock()
+
+    def conversation_messages(self) -> List[Dict[str, str]]:
+        with self._lock:
+            messages: List[Dict[str, str]] = []
+            if self._summary:
+                messages.append({
+                    "role": "system",
+                    "content": f"Conversation summary for context:\n{self._summary}",
+                })
+            for user_text, assistant_text in self._turns:
+                if user_text:
+                    messages.append({"role": "user", "content": user_text})
+                if assistant_text:
+                    messages.append({"role": "assistant", "content": assistant_text})
+            return messages
+
+    def summary_source_messages(self) -> List[Dict[str, str]]:
+        with self._lock:
+            messages: List[Dict[str, str]] = []
+            if self._summary:
+                messages.append({
+                    "role": "system",
+                    "content": f"Existing summary context:\n{self._summary}",
+                })
+            for user_text, assistant_text in self._turns:
+                if user_text:
+                    messages.append({"role": "user", "content": user_text})
+                if assistant_text:
+                    messages.append({"role": "assistant", "content": assistant_text})
+            return messages
+
+    def should_summarize(self) -> bool:
+        with self._lock:
+            return len(self._turns) >= self._max_turns
+
+    def has_pending_history(self) -> bool:
+        with self._lock:
+            return bool(self._turns)
+
+    def record_turn(self, user_text: str, assistant_text: str) -> None:
+        sanitized_user = user_text.strip()
+        sanitized_assistant = assistant_text.strip()
+        with self._lock:
+            self._turns.append((sanitized_user, sanitized_assistant))
+
+    def apply_summary(self, summary_text: str) -> None:
+        cleaned_summary = summary_text.strip()
+        with self._lock:
+            if cleaned_summary:
+                self._summary = cleaned_summary
+            self._turns.clear()
+
+
+_CONVERSATION_MEMORY = ConversationMemory()
+
+
 def _stage_direction_to_audio_tag(direction: str) -> str:
     """Map Herdora's stage directions to ElevenLabs v3 audio tags."""
 
@@ -111,7 +182,7 @@ def _normalize_stage_direction(match: re.Match[str]) -> str:
 
 
 def _normalize_script(script: str) -> str:
-    """Normalize Herdora's cues so ElevenLabs v3 picks up expressive tags."""
+    """Normalize Herdora's cues so ElevenLabs picks up expressive tags."""
 
     normalized = _STAGE_DIRECTION_PATTERN.sub(_normalize_stage_direction, script)
     normalized = re.sub(r"(?<!\S)\*(?!\S)", "[sighs]", normalized)
@@ -119,127 +190,107 @@ def _normalize_script(script: str) -> str:
     return normalized.strip()
 
 
-def _extract_executable_code(raw_text: str) -> tuple[Optional[str], bool]:
-    """Pull the first executable code block (or treat entire text as code)."""
+def _extract_python_script(response_text: str) -> Optional[str]:
+    """Pull the first Python code block (or inline script) from the model reply."""
 
-    candidate: Optional[str] = None
-    block_match = _CODE_BLOCK_PATTERN.search(raw_text)
-    found_code_block = bool(block_match)
+    match = _CODE_BLOCK_PATTERN.search(response_text)
+    if match:
+        return textwrap.dedent(match.group(1)).strip()
 
-    if block_match:
-        candidate = block_match.group(1).strip()
-    else:
-        candidate = raw_text.strip()
+    if "speech(" in response_text:
+        return response_text.strip()
 
-    if not candidate:
-        return None, found_code_block
-
-    try:
-        compile(candidate, "<herdora_generated>", "exec")
-    except SyntaxError:
-        return None, found_code_block
-
-    return candidate, found_code_block
+    return None
 
 
-def _format_speech_invocation(arguments: Mapping[str, Any]) -> str:
-    """Render a deterministic speech(...) invocation as executable code."""
+def _sanitize_script_lines(script: str) -> str:
+    """Strip leading comment markers so we can parse commented-out speech calls."""
 
-    parameter_order = (
-        "text",
-        "voice_id",
-        "model_id",
-        "stability",
-        "similarity_boost",
-        "style",
-        "playback",
-    )
-
-    lines: List[str] = ["speech("]
-    for name in parameter_order:
-        if name not in arguments:
-            continue
-        value = arguments[name]
-        if isinstance(value, str):
-            value_repr = json.dumps(value)
+    sanitized_lines: List[str] = []
+    for raw_line in script.splitlines():
+        stripped = raw_line.lstrip()
+        if stripped.startswith("#"):
+            sanitized_lines.append(stripped.lstrip("#").lstrip())
         else:
-            value_repr = repr(value)
-        lines.append(f"    {name}={value_repr},")
-    lines.append(")")
-    return "\n".join(lines)
+            sanitized_lines.append(raw_line)
+    return textwrap.dedent("\n".join(sanitized_lines)).strip()
 
 
-def _execute_generated_code(code: str, actions: List[Dict[str, Any]]) -> bool:
-    """Execute Herdora's emitted script while tracking speech actions.
+def _extract_speech_kwargs(script: str) -> Optional[Dict[str, Any]]:
+    """Parse a script and return kwargs for speech(...) if present."""
 
-    Returns True when the generated code invoked speech(); otherwise False.
-    """
-
-    import llm_functions  # Imported lazily to avoid circular dependencies
-
-    def speech_wrapper(
-        text: str,
-        *,
-        voice_id: Optional[str] = None,
-        model_id: Optional[str] = None,
-        stability: Optional[float] = None,
-        similarity_boost: Optional[float] = None,
-        style: Optional[float] = None,
-        playback: bool = True,
-    ) -> Dict[str, Any]:
-        raw_arguments: Dict[str, Any] = {
-            "text": text,
-            "voice_id": voice_id,
-            "model_id": model_id,
-            "stability": stability,
-            "similarity_boost": similarity_boost,
-            "style": style,
-            "playback": playback,
-        }
-
-        sanitized_arguments = {
-            key: value for key, value in raw_arguments.items() if value is not None or key == "playback"
-        }
-        sanitized_arguments["text"] = _normalize_script(str(sanitized_arguments["text"]))
-
-        result = call_registered_function("speech", sanitized_arguments)
-        actions.append(
-            {
-                "name": "speech",
-                "arguments": sanitized_arguments,
-                "result": result,
-            }
-        )
-        return result
-
-    original_speech = llm_functions.speech
-    llm_functions.speech = speech_wrapper  # type: ignore[assignment]
-
-    execution_globals: Dict[str, Any] = {
-        "__name__": "__main__",
-        "speech": speech_wrapper,
-    }
-
-    starting_len = len(actions)
-    invoked_speech = False
+    sanitized_script = _sanitize_script_lines(script)
+    if not sanitized_script:
+        return None
 
     try:
-        exec(code, execution_globals, {})
-        new_actions = actions[starting_len:]
-        invoked_speech = any(action.get("name") == "speech" for action in new_actions)
-    except Exception as exc:  # pragma: no cover - defensive runtime guard
-        raise RuntimeError("Failed to execute Herdora's generated script.") from exc
-    finally:
-        llm_functions.speech = original_speech  # type: ignore[assignment]
+        tree = ast.parse(sanitized_script, mode="exec")
+    except SyntaxError:
+        return None
 
-    return invoked_speech
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+
+        func = node.func
+        if isinstance(func, ast.Name):
+            func_name = func.id
+        elif isinstance(func, ast.Attribute):
+            func_name = func.attr
+        else:
+            continue
+
+        if func_name != "speech":
+            continue
+
+        call_kwargs: Dict[str, Any] = {}
+
+        if node.args:
+            try:
+                call_kwargs.setdefault("text", ast.literal_eval(node.args[0]))
+            except Exception:
+                return None
+
+        for keyword in node.keywords:
+            if keyword.arg is None:
+                continue
+            try:
+                call_kwargs[keyword.arg] = ast.literal_eval(keyword.value)
+            except Exception:
+                return None
+
+        text_value = call_kwargs.get("text")
+        if isinstance(text_value, str):
+            return call_kwargs
+
+    return None
+
+
+def _build_messages(user_prompt: str, memory_messages: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+    persona = _load_system_prompt()
+    system_lines = [
+        persona,
+        "Stay focused on code critique and deliver a single spoken reply Herdora can voice.",
+        "Keep it under three sentences, weave in vocal cues like [sighs] or [mutters], and end with a begrudging offer to assist.",
+    ]
+
+    function_list = _describe_registered_functions()
+    if function_list:
+        system_lines.append("Available tools you can call directly:")
+        system_lines.append(function_list)
+        system_lines.append("Call a tool when you need it instead of writing manual boilerplate.")
+
+    messages: List[Dict[str, Any]] = [{"role": "system", "content": "\n\n".join(system_lines)}]
+    if memory_messages:
+        messages.extend(memory_messages)
+    messages.append({"role": "user", "content": user_prompt})
+    return messages
 
 
 def _request_herdora_completion(
     messages: List[Dict[str, Any]],
     *,
-    allow_functions: bool,
-    allowed_functions: Optional[Iterable[str]] = None,
+    allow_functions: bool = True,
 ) -> Any:
     api_key = os.getenv("HERDORA_API_KEY")
     if not api_key:
@@ -248,42 +299,27 @@ def _request_herdora_completion(
     base_url = os.getenv("HERDORA_BASE_URL", "https://pygmalion.herdora.com/v1")
     model = os.getenv("HERDORA_MODEL", "Qwen/Qwen3-VL-235B-A22B-Instruct")
 
+    kwargs: Dict[str, Any] = {"model": model, "messages": messages}
+    if allow_functions:
+        schemas = list(function_schemas())
+        if schemas:
+            kwargs["functions"] = schemas
+            kwargs["function_call"] = "auto"
+        else:
+            kwargs["function_call"] = "none"
+    else:
+        kwargs["function_call"] = "none"
+
     try:
         from openai import OpenAI  # type: ignore
 
         client = OpenAI(api_key=api_key, base_url=base_url)
-        kwargs: Dict[str, Any] = {"model": model, "messages": messages}
-        if allow_functions:
-            schemas = list(function_schemas())
-            if allowed_functions is not None:
-                allowed_set = {name for name in allowed_functions}
-                schemas = [schema for schema in schemas if schema.get("name") in allowed_set]
-            if schemas:
-                kwargs["functions"] = schemas
-                kwargs["function_call"] = "auto"
-            else:
-                kwargs["function_call"] = "none"
-        else:
-            kwargs["function_call"] = "none"
         return client.chat.completions.create(**kwargs)
     except ImportError:
         import openai  # type: ignore
 
         openai.api_key = api_key
         openai.api_base = base_url
-        kwargs = {"model": model, "messages": messages}
-        if allow_functions:
-            schemas = list(function_schemas())
-            if allowed_functions is not None:
-                allowed_set = {name for name in allowed_functions}
-                schemas = [schema for schema in schemas if schema.get("name") in allowed_set]
-            if schemas:
-                kwargs["functions"] = schemas
-                kwargs["function_call"] = "auto"
-            else:
-                kwargs["function_call"] = "none"
-        else:
-            kwargs["function_call"] = "none"
         return openai.ChatCompletion.create(**kwargs)
 
 
@@ -314,138 +350,196 @@ def _extract_content(message_dict: Dict[str, Any]) -> str:
     return str(content or "")
 
 
-def _maybe_get_function_call(message_dict: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    call = message_dict.get("function_call") or message_dict.get("tool_calls")
-    if isinstance(call, list):
-        return call[0] if call else None
-    return call
-
-
-def _first_choice(response: Any) -> Any:
-    if isinstance(response, dict):
-        return response["choices"][0]
-    return response.choices[0]
-
-
-def talk(
-    user_prompt: str = DEFAULT_USER_PROMPT,
-) -> Dict[str, Any]:
-    """Generate Herdora's sarcastic take using function-calling tools."""
-
-    messages: List[Dict[str, Any]] = _build_messages(user_prompt)
-    actions: List[Dict[str, Any]] = []
-
-    first_response = _request_herdora_completion(
-        messages,
-        allow_functions=True,
-        allowed_functions=("speech",),
-    )
-    first_choice = _first_choice(first_response)
-    first_message_payload = first_choice["message"] if isinstance(first_choice, dict) else first_choice.message
-    first_message = _message_to_dict(first_message_payload)
-
-    fn_call = _maybe_get_function_call(first_message)
-    if fn_call:
-        function_name = fn_call.get("name")
-        raw_arguments = fn_call.get("arguments") or "{}"
-        try:
-            parsed_arguments = json.loads(raw_arguments)
-        except json.JSONDecodeError:
-            parsed_arguments = {}
-
-        if function_name:
-            sanitized_arguments = dict(parsed_arguments)
-            if "text" in sanitized_arguments:
-                sanitized_arguments["text"] = _normalize_script(str(sanitized_arguments["text"]))
-
-            function_result = call_registered_function(function_name, sanitized_arguments)
-            actions.append(
+def _extract_tool_calls(message_dict: Dict[str, Any]) -> List[Dict[str, Any]]:
+    tool_calls_field = message_dict.get("tool_calls")
+    if isinstance(tool_calls_field, list) and tool_calls_field:
+        normalized_calls: List[Dict[str, Any]] = []
+        for call in tool_calls_field:
+            if not isinstance(call, Mapping):
+                continue
+            function_payload = call.get("function", {})
+            if not isinstance(function_payload, Mapping):
+                continue
+            normalized_calls.append(
                 {
-                    "name": function_name,
-                    "arguments": sanitized_arguments,
-                    "result": function_result,
+                    "id": call.get("id"),
+                    "name": function_payload.get("name"),
+                    "arguments": function_payload.get("arguments", {}),
                 }
             )
+        return normalized_calls
 
-            messages.extend(
-                [
-                    {
-                        "role": "assistant",
-                        "content": None,
-                        "function_call": {
-                            "name": function_name,
-                            "arguments": json.dumps(sanitized_arguments),
-                        },
-                    },
+    function_call = message_dict.get("function_call")
+    if isinstance(function_call, Mapping):
+        return [
+            {
+                "id": None,
+                "name": function_call.get("name"),
+                "arguments": function_call.get("arguments", {}),
+            }
+        ]
+    return []
+
+
+def _parse_arguments(arguments: Any) -> Dict[str, Any]:
+    if isinstance(arguments, str):
+        try:
+            return json.loads(arguments)
+        except json.JSONDecodeError:
+            return {}
+    if isinstance(arguments, Mapping):
+        return dict(arguments)
+    return {}
+
+
+def _invoke_tool(
+    name: Optional[str],
+    arguments: Dict[str, Any],
+    actions: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    if not name:
+        return {}
+
+    sanitized_arguments = dict(arguments)
+    if name == "speech" and "text" in sanitized_arguments:
+        sanitized_arguments["text"] = _normalize_script(str(sanitized_arguments["text"]))
+
+    result = call_registered_function(name, sanitized_arguments)
+    actions.append({"name": name, "arguments": sanitized_arguments, "result": result})
+    return result
+
+
+def _chat_with_tools(messages: List[Dict[str, Any]]) -> tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
+    """Iteratively query the model, executing tools until a final reply arrives."""
+
+    working_messages = list(messages)
+    actions: List[Dict[str, Any]] = []
+
+    for _ in range(_MAX_TOOL_ITERATIONS):
+        response = _request_herdora_completion(working_messages, allow_functions=True)
+        choice = response["choices"][0] if isinstance(response, dict) else response.choices[0]
+        message_payload = choice["message"] if isinstance(choice, dict) else choice.message
+        message_dict = _message_to_dict(message_payload)
+
+        tool_calls = _extract_tool_calls(message_dict)
+        if tool_calls:
+            for call in tool_calls:
+                name = call.get("name")
+                parsed_arguments = _parse_arguments(call.get("arguments"))
+                result = _invoke_tool(name, parsed_arguments, actions)
+
+                assistant_tool_message: Dict[str, Any] = {"role": "assistant", "content": None}
+                serialized_arguments = json.dumps(actions[-1]["arguments"])
+                if call.get("id"):
+                    assistant_tool_message["tool_calls"] = [
+                        {
+                            "id": call.get("id"),
+                            "type": "function",
+                            "function": {"name": name, "arguments": serialized_arguments},
+                        }
+                    ]
+                else:
+                    assistant_tool_message["function_call"] = {
+                        "name": name,
+                        "arguments": serialized_arguments,
+                    }
+                working_messages.append(assistant_tool_message)
+                working_messages.append(
                     {
                         "role": "function",
-                        "name": function_name,
-                        "content": json.dumps(function_result),
-                    },
-                ]
-            )
+                        "name": name,
+                        "content": json.dumps(result),
+                    }
+                )
+            continue
 
-            second_response = _request_herdora_completion(messages, allow_functions=False)
-            second_choice = _first_choice(second_response)
-            second_message_payload = (
-                second_choice["message"] if isinstance(second_choice, dict) else second_choice.message
-            )
-            second_message = _message_to_dict(second_message_payload)
-            final_text = _extract_content(second_message)
-        else:
-            final_text = _extract_content(first_message)
-    else:
-        final_text = _extract_content(first_message)
+        final_text = _extract_content(message_dict).strip()
+        return final_text, actions, message_dict
+
+    raise RuntimeError("Exceeded tool iteration limit without final response.")
+
+
+def _summarize_conversation(memory: ConversationMemory) -> None:
+    summary_messages = memory.summary_source_messages()
+    if not summary_messages:
+        memory.apply_summary("")
+        return
+
+    persona = _load_system_prompt()
+    messages: List[Dict[str, Any]] = [
+        {"role": "system", "content": persona},
+        {
+            "role": "system",
+            "content": (
+                "You are refreshing your working memory. Summarize the conversation so far "
+                "in under 150 words, focusing on the user's goals, code issues, tone, and "
+                "any open follow-up work."
+            ),
+        },
+    ]
+    messages.extend(summary_messages)
+    messages.append(
+        {
+            "role": "user",
+            "content": "Summarize the conversation so you can reference it in future replies.",
+        }
+    )
+
+    response = _request_herdora_completion(messages, allow_functions=False)
+    choice = response["choices"][0] if isinstance(response, dict) else response.choices[0]
+    message_payload = choice["message"] if isinstance(choice, dict) else choice.message
+    message_dict = _message_to_dict(message_payload)
+    summary_text = _extract_content(message_dict).strip()
+    memory.apply_summary(summary_text)
+
+
+def talk(user_prompt: str = DEFAULT_USER_PROMPT) -> Dict[str, Any]:
+    """Generate Herdora's sarcastic take using function-calling tools with memory."""
+
+    if _CONVERSATION_MEMORY.should_summarize() and _CONVERSATION_MEMORY.has_pending_history():
+        _summarize_conversation(_CONVERSATION_MEMORY)
+
+    memory_messages = _CONVERSATION_MEMORY.conversation_messages()
+    messages = _build_messages(user_prompt, memory_messages)
+
+    final_text, actions, assistant_message = _chat_with_tools(messages)
+
+    has_speech_action = any(action.get("name") == "speech" for action in actions)
+
+    if not has_speech_action:
+        script = _extract_python_script(final_text)
+        if script:
+            speech_kwargs = _extract_speech_kwargs(script)
+            if speech_kwargs and isinstance(speech_kwargs.get("text"), str):
+                speech_kwargs["text"] = _normalize_script(str(speech_kwargs["text"]))
+                call_arguments = dict(speech_kwargs)
+                result = call_registered_function("speech", call_arguments)
+                actions.append({"name": "speech", "arguments": call_arguments, "result": result})
+                final_text = call_arguments["text"]
+                has_speech_action = True
+
+    if not final_text:
+        speech_action = next((action for action in reversed(actions) if action.get("name") == "speech"), None)
+        if speech_action:
+            final_text = str(speech_action["arguments"].get("text", ""))
 
     final_text = final_text.strip()
 
-    code_snippet, had_code_block = _extract_executable_code(final_text)
-    fallback_reason: Optional[str] = None
+    if final_text and not has_speech_action:
+        normalized_text = _normalize_script(final_text)
+        call_arguments = {"text": normalized_text}
+        result = call_registered_function("speech", call_arguments)
+        actions.append({"name": "speech", "arguments": call_arguments, "result": result})
+        final_text = normalized_text
+        has_speech_action = True
 
-    if code_snippet:
-        if _execute_generated_code(code_snippet, actions):
-            return {
-                "text": code_snippet,
-                "actions": actions,
-            }
-        fallback_reason = "Generated script executed without invoking speech."
+    if not final_text:
+        final_text = "*sighs* Herdora handled the response via audio only."
 
-    if had_code_block and not code_snippet:
-        raise RuntimeError("Generated code block was not runnable.")
-
-    normalized_text = _normalize_script(final_text)
-    if not normalized_text:
-        normalized_text = "Herdora had nothing to add beyond snarling into the void."
-
-    existing_speech = next((action for action in actions if action.get("name") == "speech"), None)
-    if existing_speech:
-        rendered_script = _format_speech_invocation(existing_speech["arguments"])
-        return {
-            "text": rendered_script,
-            "actions": actions,
-        }
-
-    fallback_text = normalized_text
-    if fallback_reason:
-        summary = normalized_text or "I wound up speechless."
-        fallback_text = (
-            f"*sighs wearily* {fallback_reason} So here's a begrudging recap: {summary}"
-        )
-    if not fallback_text.startswith("*"):
-        fallback_text = f"*sighs wearily* {fallback_text}"
-    fallback_text = _normalize_script(fallback_text)
-    if not fallback_text:
-        fallback_text = "*sighs wearily* I wound up speechless."
-
-    fallback_arguments: Dict[str, Any] = {
-        "text": fallback_text,
-        "stability": 0.25,
-        "similarity_boost": 0.6,
-    }
-    fallback_script = _format_speech_invocation(fallback_arguments)
-    _execute_generated_code(fallback_script, actions)
+    _CONVERSATION_MEMORY.record_turn(user_prompt, final_text)
 
     return {
-        "text": fallback_script,
+        "text": final_text,
         "actions": actions,
+        "assistant_message": assistant_message,
     }
