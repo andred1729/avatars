@@ -87,21 +87,29 @@ def _transcribe_audio_file(audio_path: Path) -> Tuple[str, Optional[Dict[str, An
         return str(text).strip(), payload if isinstance(payload, dict) else None
 
     # Fallback to OpenAI transcription if ElevenLabs key is not configured.
-    api_key = os.getenv("HERDORA_API_KEY") or os.getenv("OPENAI_API_KEY")
-    if not api_key:
+    openai_key = os.getenv("OPENAI_API_KEY")
+    herdora_key = os.getenv("HERDORA_API_KEY")
+    base_url = os.getenv("HERDORA_BASE_URL", "").strip()
+
+    if not openai_key and base_url:
         raise EnvironmentError(
-            "Set ELEVENLABS_API_KEY or (HERDORA_API_KEY / OPENAI_API_KEY) for audio transcription."
+            "Voice capture requires ELEVENLABS_API_KEY or OPENAI_API_KEY. The configured HERDORA_BASE_URL does not expose audio transcription."
         )
 
-    base_url = os.getenv("HERDORA_BASE_URL")
-    model = os.getenv("HERDORA_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")
+    api_key = openai_key or herdora_key
+    if not api_key:
+        raise EnvironmentError(
+            "Set ELEVENLABS_API_KEY or OPENAI_API_KEY to enable audio transcription."
+        )
+
+    transcribe_model = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")
 
     try:
         from openai import OpenAI  # type: ignore
 
-        client = OpenAI(api_key=api_key, base_url=base_url)
+        client = OpenAI(api_key=api_key, base_url=None if openai_key else base_url or None)
         with audio_path.open("rb") as audio_file:
-            response = client.audio.transcriptions.create(model=model, file=audio_file)
+            response = client.audio.transcriptions.create(model=transcribe_model, file=audio_file)
         text = getattr(response, "text", None)
         if text is None and isinstance(response, Mapping):
             text = response.get("text")
@@ -120,10 +128,15 @@ def _transcribe_audio_file(audio_path: Path) -> Tuple[str, Optional[Dict[str, An
         import openai  # type: ignore
 
         openai.api_key = api_key
-        if base_url:
+        if openai_key:
+            openai.api_base = "https://api.openai.com/v1"
+        elif base_url:
             openai.api_base = base_url
         with audio_path.open("rb") as audio_file:
-            response = openai.Audio.transcribe(model=model, file=audio_file)  # type: ignore[attr-defined]
+            try:
+                response = openai.Audio.transcribe(model=transcribe_model, file=audio_file)  # type: ignore[attr-defined]
+            except AttributeError:
+                response = openai.audio.transcriptions.create(model=transcribe_model, file=audio_file)  # type: ignore[attr-defined]
         text = response.get("text") if isinstance(response, dict) else getattr(response, "text", None)
         if not text:
             raise RuntimeError("Transcription response did not include text.")
@@ -252,6 +265,8 @@ async def submit_voice(
 
     try:
         transcript_text, transcript_payload = _transcribe_audio_file(audio_path)
+    except EnvironmentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except PermissionError as exc:
         raise HTTPException(
             status_code=400,

@@ -44,15 +44,12 @@
         background-color: rgba(160, 190, 235, 0.9);
       }
 
-      h1 {
+      .panel-title {
         margin: 0;
-        font-size: 2rem;
         text-align: center;
         margin-bottom: 1.5rem;
-      }
-
-      .right-div h2 {
-        text-align: center;
+        font-size: 1.8rem;
+        font-weight: 600;
       }
 
       form {
@@ -111,20 +108,6 @@
       .result.error {
         background-color: rgba(255, 244, 244, 0.9);
         border-color: rgba(241, 75, 75, 0.2);
-      }
-
-      .voice-status {
-        margin-top: 0.75rem;
-        text-align: center;
-        font-size: 0.95rem;
-        font-weight: 600;
-        color: #1a1a1a;
-      }
-
-      @media (prefers-color-scheme: dark) {
-        .voice-status {
-          color: #f5f5f5;
-        }
       }
 
       pre {
@@ -195,7 +178,7 @@
   <body>
     <div class="container">
       <div class="left-div">
-        <h1>Code Submission</h1>
+        <h2 class="panel-title">Code Submission</h2>
         <form id="code-form" action="#" method="post">
           <label for="code" class="sr-only">Paste your code snippet</label>
           <textarea
@@ -205,7 +188,6 @@
             placeholder="Paste your code snippet here"
             required
           >{{ code if code else '' }}</textarea>
-          <button type="button" id="code-submit" disabled title="Voice capture handles submission">Voice capture handles submission</button>
         </form>
 
         {% if error %}
@@ -216,7 +198,7 @@
         {% endif %}
       </div>
       <div class="right-div">
-        <h2>Output</h2>
+        <h2 class="panel-title">Output</h2>
         <textarea
           id="output"
           name="output"
@@ -224,7 +206,6 @@
           placeholder="Result will appear here"
           readonly
         >{% if result %}{{ result }}{% endif %}</textarea>
-        <div id="voice-status" class="voice-status">Press Shift+V to start recording; press again to stop and submit.</div>
       </div>
     </div>
     <div class="whiteboard-overlay" id="whiteboard-overlay">
@@ -258,10 +239,12 @@
 
       let recordingStream = null;
       let mediaRecorder = null;
-      let audioChunks = [];
+      let queuedAudioChunks = [];
+      let chunkResolvers = [];
       let isRecordingVoice = false;
       let isProcessingVoice = false;
       const VOICE_KEY_CODE = 'KeyV';
+      const CONTINUOUS_TIMESLICE_MS = 1000;
 
       let whiteboardActive = false;
       let currentTool = 'draw';
@@ -360,6 +343,74 @@
         }
       }
 
+      function resolveQueuedChunkResolvers() {
+        if (!chunkResolvers.length) {
+          return;
+        }
+        const pendingResolvers = chunkResolvers.slice();
+        chunkResolvers = [];
+        pendingResolvers.forEach((waiter) => {
+          try {
+            waiter.resolve();
+          } catch (resolverError) {
+            console.error('Voice chunk resolver failed:', resolverError);
+          }
+        });
+      }
+
+      function waitForNextChunk(timeoutMs = 1000) {
+        if (queuedAudioChunks.length > 0) {
+          return Promise.resolve();
+        }
+        return new Promise((resolve) => {
+          let settled = false;
+          const waiter = {
+            resolve: () => {
+              if (settled) {
+                return;
+              }
+              settled = true;
+              if (waiter.timer) {
+                clearTimeout(waiter.timer);
+              }
+              resolve();
+            },
+            timer: null,
+          };
+          waiter.timer = window.setTimeout(() => {
+            if (settled) {
+              return;
+            }
+            settled = true;
+            chunkResolvers = chunkResolvers.filter((entry) => entry !== waiter);
+            resolve();
+          }, timeoutMs);
+          chunkResolvers.push(waiter);
+        });
+      }
+
+      async function collectRecentAudioBlob() {
+        if (!mediaRecorder) {
+          return null;
+        }
+        if (mediaRecorder.state === 'recording') {
+          try {
+            mediaRecorder.requestData();
+          } catch (error) {
+            console.error('Failed to request audio data:', error);
+          }
+        }
+        if (queuedAudioChunks.length === 0) {
+          await waitForNextChunk(1000);
+        }
+        if (queuedAudioChunks.length === 0) {
+          return null;
+        }
+        const chunks = queuedAudioChunks.slice();
+        queuedAudioChunks = [];
+        return new Blob(chunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+      }
+
       async function captureScreenshotBlob() {
         if (typeof window.html2canvas !== 'function') {
           return null;
@@ -403,7 +454,7 @@
           formData.append('code', codeTextarea.value || '');
         }
 
-        setVoiceStatus('Sending voice submission to Herdora...');
+        setVoiceStatus('Uploading voice snippet to Herdora...');
         outputTextarea.value = '';
 
         try {
@@ -433,18 +484,18 @@
             outputTextarea.value = 'Voice submission completed, but no result was returned.';
           }
 
-          setVoiceStatus('Voice submission processed. Press Shift+V to start another recording.');
+          setVoiceStatus('Voice submission processed. Press Shift+V anytime to send another update.');
         } catch (error) {
           console.error('Voice submission error:', error);
-          setVoiceStatus('Voice submission failed. Press Shift+V to try again (see console for details).');
+          setVoiceStatus('Voice submission failed. Recording continues; press Shift+V to try again (see console for details).');
           outputTextarea.value = 'Voice submission failed. Check console for details.';
         } finally {
           isProcessingVoice = false;
-          mediaRecorder = null;
-          audioChunks = [];
           setTimeout(() => {
-            if (!isRecordingVoice) {
-              setVoiceStatus('Press Shift+V to start recording; press again to stop and submit.');
+            if (isRecordingVoice) {
+              setVoiceStatus('Recording active. Press Shift+V anytime to send your latest notes.');
+            } else {
+              setVoiceStatus('Press Shift+V to start continuous voice recording.');
             }
           }, 4000);
         }
@@ -461,29 +512,34 @@
         try {
           recordingStream = await navigator.mediaDevices.getUserMedia({ audio: true });
           mediaRecorder = new MediaRecorder(recordingStream);
-          audioChunks = [];
+          queuedAudioChunks = [];
+          chunkResolvers = [];
           mediaRecorder.addEventListener('dataavailable', (event) => {
             if (event.data && event.data.size > 0) {
-              audioChunks.push(event.data);
+              queuedAudioChunks.push(event.data);
+              resolveQueuedChunkResolvers();
             }
           });
-          mediaRecorder.addEventListener('stop', async () => {
-            const blob = audioChunks.length
-              ? new Blob(audioChunks, { type: mediaRecorder?.mimeType || 'audio/webm' })
-              : null;
+          mediaRecorder.addEventListener('error', (event) => {
+            console.error('Media recorder error:', event.error || event);
+            setVoiceStatus('Microphone error. Refresh the page to continue.');
             if (recordingStream) {
               recordingStream.getTracks().forEach((track) => track.stop());
+              recordingStream = null;
             }
-            recordingStream = null;
-            if (blob) {
-              await submitVoiceRecording(blob);
-            } else {
-              setVoiceStatus('No audio captured.');
+            isRecordingVoice = false;
+            if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+              try {
+                mediaRecorder.stop();
+              } catch (stopError) {
+                console.error('Failed to stop media recorder after error:', stopError);
+              }
             }
+            mediaRecorder = null;
           });
-          mediaRecorder.start();
+          mediaRecorder.start(CONTINUOUS_TIMESLICE_MS);
           isRecordingVoice = true;
-          setVoiceStatus('Recording… type your code, then press Shift+V again to stop and submit.');
+          setVoiceStatus('Recording continuously. Press Shift+V to send your latest voice notes to Herdora.');
         } catch (error) {
           console.error('Failed to start voice recording:', error);
           setVoiceStatus('Unable to access microphone.');
@@ -495,20 +551,27 @@
         }
       }
 
-      async function stopVoiceRecording() {
-        if (!isRecordingVoice || !mediaRecorder) {
+      async function submitVoiceSnippet() {
+        if (!mediaRecorder || mediaRecorder.state === 'inactive') {
+          isRecordingVoice = false;
+          await startVoiceRecording();
           return;
         }
-        isRecordingVoice = false;
-        setVoiceStatus('Processing recorded audio...');
-        try {
-          if (mediaRecorder.state !== 'inactive') {
-            mediaRecorder.stop();
-          }
-        } catch (error) {
-          console.error('Error stopping media recorder:', error);
-          setVoiceStatus('Voice recorder error.');
+        if (!isRecordingVoice) {
+          setVoiceStatus('Recording is not active yet. Press Shift+V to begin.');
+          return;
         }
+        if (isProcessingVoice) {
+          setVoiceStatus('Still processing previous voice submission. Please wait.');
+          return;
+        }
+        setVoiceStatus('Preparing latest voice snippet...');
+        const blob = await collectRecentAudioBlob();
+        if (!blob) {
+          setVoiceStatus('No recent voice input captured. Try speaking before sending.');
+          return;
+        }
+        await submitVoiceRecording(blob);
       }
 
       function sendStrokeToServer(stroke) {
@@ -616,12 +679,16 @@
         ) {
           event.preventDefault();
           if (isProcessingVoice) {
+            setVoiceStatus('Still processing previous voice submission. Please wait.');
             return;
           }
           if (!isRecordingVoice) {
+            if (whiteboardActive) {
+              toggleWhiteboard(false);
+            }
             await startVoiceRecording();
           } else {
-            await stopVoiceRecording();
+            await submitVoiceSnippet();
           }
           return;
         }
@@ -654,11 +721,11 @@
 
       setTool('draw');
       renderWhiteboard();
-      setVoiceStatus('Press Shift+V to start recording; press again to stop and submit.');
+      setVoiceStatus('Press Shift+V to start continuous voice capture.');
 
       form.addEventListener('submit', (event) => {
         event.preventDefault();
-        setVoiceStatus('Voice submission only. Press Shift+V to start recording; press again to stop and submit.');
+        setVoiceStatus('Voice submission only. Use Shift+V to send voice notes while recording continues.');
       });
     </script>
   </body>
