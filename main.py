@@ -187,6 +187,8 @@ async def read_form(request: Request) -> HTMLResponse:
 @app.post("/submit", response_class=HTMLResponse)
 async def submit_code(request: Request, code: str = Form(...)) -> HTMLResponse:
     """Trigger Herdora's critique and return the improved code."""
+    explanation_mode = should_open_whiteboard(code)
+
     if not os.getenv("HERDORA_API_KEY"):
         whiteboard_state = whiteboard.get_state()
         return templates.TemplateResponse(
@@ -197,6 +199,8 @@ async def submit_code(request: Request, code: str = Form(...)) -> HTMLResponse:
                 "code": code,
                 "error": "API key for Herdora must be set.",
                 "whiteboard_state": json.dumps(whiteboard_state),
+                "auto_open_whiteboard": explanation_mode,
+                "result": "" if explanation_mode else "",
             },
         )
     talk_result = talk(code)
@@ -204,8 +208,9 @@ async def submit_code(request: Request, code: str = Form(...)) -> HTMLResponse:
     improved_code = str(talk_result.get("improved_code", "")).strip()
     if not improved_code:
         improved_code = "No improved code was produced."
+    if explanation_mode:
+        improved_code = ""
     whiteboard_state = whiteboard.get_state()
-    auto_open = should_open_whiteboard(code)
     return templates.TemplateResponse(
         "index.html",
         {
@@ -214,7 +219,7 @@ async def submit_code(request: Request, code: str = Form(...)) -> HTMLResponse:
             "code": code,
             "result": improved_code,
             "whiteboard_state": json.dumps(whiteboard_state),
-            "auto_open_whiteboard": auto_open,
+            "auto_open_whiteboard": explanation_mode,
         },
     )
 
@@ -306,24 +311,25 @@ async def submit_voice(
         prompt_parts.append(f"Voice notes:\n{transcript_text}")
 
     combined_prompt = "\n\n".join(prompt_parts) if prompt_parts else transcript_text
+    explanation_mode = should_open_whiteboard(combined_prompt)
 
     talk_result = talk(combined_prompt)
     improved_code = str(talk_result.get("improved_code", "")).strip()
     if not improved_code:
         improved_code = "No improved code was produced."
+    if explanation_mode:
+        improved_code = ""
 
     whiteboard_state = whiteboard.get_state()
 
     response_payload: Dict[str, Any] = {
         "transcript": transcript_text,
         "talk": talk_result,
-        "result": improved_code,
         "whiteboard": whiteboard_state,
+        "result": improved_code,
+        "suppress_output": explanation_mode,
     }
-    if should_open_whiteboard(combined_prompt):
-        response_payload["whiteboard_action"] = "open"
-    else:
-        response_payload["whiteboard_action"] = "close"
+    response_payload["whiteboard_action"] = "open" if explanation_mode else "close"
     if transcript_payload:
         response_payload["transcription_details"] = transcript_payload
 

@@ -515,7 +515,10 @@
             autoCloseWhiteboard();
           }
 
-          if (payload.result) {
+          const suppressOutput = Boolean(payload.suppress_output);
+          if (suppressOutput) {
+            outputTextarea.value = '';
+          } else if (payload.result) {
             outputTextarea.value = payload.result;
           } else if (payload.talk && payload.talk.text) {
             outputTextarea.value = payload.talk.text;
