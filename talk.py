@@ -3,22 +3,39 @@
 from __future__ import annotations
 
 import ast
+import base64
+import hashlib
 import json
+import mimetypes
 import os
 import re
 import textwrap
 import threading
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from llm_functions import call_registered_function, function_schemas
 from write import write as rewrite_code
 
-SYSTEM_PROMPT_PATH = Path(__file__).resolve().parents[0] / "prompts" / "avatar_system_prompt.txt"
+BASE_DIR = Path(__file__).resolve().parent
+SYSTEM_PROMPT_PATH = BASE_DIR / "prompts" / "avatar_system_prompt.txt"
 DEFAULT_USER_PROMPT = (
     "Share your bleakest assessment of the current code, then begrudgingly offer to help."
 )
 _MAX_TOOL_ITERATIONS = 8
+
+_LOCALHOST_IMAGE_DIR = Path(
+    os.getenv("LOCALHOST_IMAGE_DIR", str(BASE_DIR / "runtime" / "views"))
+)
+_LOCALHOST_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+
+_SUPPORTED_IMAGE_MIME: Dict[str, str] = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+}
 
 
 def _load_system_prompt() -> str:
@@ -101,6 +118,8 @@ class ConversationMemory:
         self._turns: List[tuple[str, str]] = []
         self._summary: Optional[str] = None
         self._lock = threading.Lock()
+        self._last_image_hash: Optional[str] = None
+        self._last_improved_code: Optional[str] = None
 
     def conversation_messages(self) -> List[Dict[str, str]]:
         with self._lock:
@@ -140,11 +159,32 @@ class ConversationMemory:
         with self._lock:
             return bool(self._turns)
 
-    def record_turn(self, user_text: str, assistant_text: str) -> None:
+    def last_image_hash(self) -> Optional[str]:
+        with self._lock:
+            return self._last_image_hash
+
+    def last_improved_code(self) -> Optional[str]:
+        with self._lock:
+            return self._last_improved_code
+
+    def record_turn(
+        self,
+        user_text: str,
+        assistant_text: str,
+        *,
+        improved_code: Optional[str] = None,
+        image_hash: Optional[str] = None,
+    ) -> None:
         sanitized_user = user_text.strip()
         sanitized_assistant = assistant_text.strip()
         with self._lock:
             self._turns.append((sanitized_user, sanitized_assistant))
+            if improved_code:
+                normalized_code = improved_code.strip()
+                if normalized_code:
+                    self._last_improved_code = normalized_code
+            if image_hash:
+                self._last_image_hash = image_hash
 
     def apply_summary(self, summary_text: str) -> None:
         cleaned_summary = summary_text.strip()
@@ -189,6 +229,78 @@ def _normalize_script(script: str) -> str:
     normalized = re.sub(r"(?<!\S)\*(?!\S)", "[sighs]", normalized)
     normalized = re.sub(r"\s+", lambda m: " " if "\n" not in m.group(0) else m.group(0), normalized)
     return normalized.strip()
+
+
+def _latest_localhost_image() -> Optional[Path]:
+    try:
+        candidates: List[Path] = []
+        for suffix in _SUPPORTED_IMAGE_MIME:
+            candidates.extend(_LOCALHOST_IMAGE_DIR.glob(f"*{suffix}"))
+        if not candidates:
+            return None
+        return max(candidates, key=lambda candidate: candidate.stat().st_mtime)
+    except FileNotFoundError:
+        return None
+
+
+def _load_localhost_snapshot() -> Optional[Tuple[Dict[str, Any], str, str]]:
+    path = _latest_localhost_image()
+    if not path:
+        return None
+
+    mime = _SUPPORTED_IMAGE_MIME.get(path.suffix.lower())
+    if not mime:
+        guessed_mime, _ = mimetypes.guess_type(path.name)
+        mime = guessed_mime or "image/png"
+
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    if not data:
+        return None
+
+    data_url = f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+    image_hash = hashlib.sha256(data).hexdigest()
+    payload: Dict[str, Any] = {
+        "type": "image_url",
+        "image_url": {
+            "url": data_url,
+            "detail": "high",
+        },
+    }
+    return payload, image_hash, path.name
+
+
+def _prepare_submission_text(
+    user_prompt: str,
+    memory: ConversationMemory,
+    snapshot_descriptor: Optional[str],
+) -> str:
+    submission = user_prompt.strip()
+    last_output = memory.last_improved_code()
+    note_lines: List[str] = []
+
+    if last_output and submission and submission == last_output.strip():
+        note_lines.append(
+            "Note: Submission matches your previous Output. Treat it as reference unless new requests appear."
+        )
+        submission = ""
+
+    if snapshot_descriptor:
+        note_lines.append(snapshot_descriptor)
+
+    if submission:
+        if note_lines:
+            note_lines.insert(0, f"Submission:\n{submission}")
+        else:
+            note_lines.append(f"Submission:\n{submission}")
+    elif note_lines:
+        pass
+    else:
+        note_lines.append("Submission is empty; relying on visual context only.")
+
+    return "\n\n".join(note_lines).strip()
 
 
 def _extract_python_script(response_text: str) -> Optional[str]:
@@ -307,12 +419,21 @@ def _extract_improved_from_actions(actions: Optional[List[Dict[str, Any]]]) -> s
     return ""
 
 
-def _build_messages(user_prompt: str, memory_messages: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+def _build_messages(
+    submission_text: str,
+    memory_messages: List[Dict[str, str]],
+    image_payload: Optional[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
     persona = _load_system_prompt()
     system_lines = [
         persona,
         "Stay focused on code critique and deliver a single spoken reply Herdora can voice.",
+        (
+            "Always respond directly to the user's Submission field. The Output panel shows"
+            " your prior work—treat matching snippets as your own and avoid repeating them."
+        ),
         "Keep it under three sentences, weave in vocal cues like [sighs] or [mutters], and end with a begrudging offer to assist.",
+        "Use the attached localhost visual only as supplemental context; rely on the Submission text for precise code changes.",
     ]
 
     function_list = _describe_registered_functions()
@@ -324,7 +445,20 @@ def _build_messages(user_prompt: str, memory_messages: List[Dict[str, str]]) -> 
     messages: List[Dict[str, Any]] = [{"role": "system", "content": "\n\n".join(system_lines)}]
     if memory_messages:
         messages.extend(memory_messages)
-    messages.append({"role": "user", "content": user_prompt})
+    user_content_parts: List[Dict[str, Any]] = []
+    if submission_text:
+        user_content_parts.append({"type": "text", "text": submission_text})
+    if image_payload:
+        user_content_parts.append(image_payload)
+
+    if not user_content_parts:
+        user_content: Any = "Submission was empty."
+    elif len(user_content_parts) == 1 and user_content_parts[0].get("type") == "text":
+        user_content = user_content_parts[0]["text"]
+    else:
+        user_content = user_content_parts
+
+    messages.append({"role": "user", "content": user_content})
     return messages
 
 
@@ -541,7 +675,31 @@ def talk(user_prompt: str = DEFAULT_USER_PROMPT) -> Dict[str, Any]:
         _summarize_conversation(_CONVERSATION_MEMORY)
 
     memory_messages = _CONVERSATION_MEMORY.conversation_messages()
-    messages = _build_messages(user_prompt, memory_messages)
+
+    snapshot_info = _load_localhost_snapshot()
+    image_payload: Optional[Dict[str, Any]] = None
+    image_hash_for_record: Optional[str] = None
+    snapshot_descriptor: Optional[str] = None
+
+    if snapshot_info:
+        payload, image_hash, image_name = snapshot_info
+        if image_hash != _CONVERSATION_MEMORY.last_image_hash():
+            image_payload = payload
+            image_hash_for_record = image_hash
+            snapshot_descriptor = (
+                f"Visual context: Attached localhost capture '{image_name}' for reference."
+            )
+        else:
+            snapshot_descriptor = (
+                f"Visual context unchanged: previous localhost capture '{image_name}' remains current."
+            )
+
+    submission_text = _prepare_submission_text(
+        user_prompt,
+        _CONVERSATION_MEMORY,
+        snapshot_descriptor,
+    )
+    messages = _build_messages(submission_text, memory_messages, image_payload)
 
     final_text, actions, assistant_message = _chat_with_tools(messages)
 
@@ -577,8 +735,6 @@ def talk(user_prompt: str = DEFAULT_USER_PROMPT) -> Dict[str, Any]:
     if not final_text:
         final_text = "*sighs* Herdora handled the response via audio only."
 
-    _CONVERSATION_MEMORY.record_turn(user_prompt, final_text)
-
     improved_code: str = ""
     rewrite_payload: Optional[Dict[str, Any]] = None
     rewrite_error: Optional[str] = None
@@ -592,6 +748,13 @@ def talk(user_prompt: str = DEFAULT_USER_PROMPT) -> Dict[str, Any]:
                 improved_code = _extract_improved_from_actions(rewrite_payload.get("actions"))
     except Exception as exc:  # pragma: no cover - defensive guard
         rewrite_error = str(exc)
+
+    _CONVERSATION_MEMORY.record_turn(
+        user_prompt,
+        final_text,
+        improved_code=improved_code,
+        image_hash=image_hash_for_record,
+    )
 
     response: Dict[str, Any] = {
         "text": final_text,
