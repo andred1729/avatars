@@ -90,6 +90,11 @@
         border: 1px solid rgba(75, 130, 241, 0.2);
       }
 
+      .result.error {
+        background-color: rgba(255, 244, 244, 0.9);
+        border-color: rgba(241, 75, 75, 0.2);
+      }
+
       pre {
         margin: 0;
         white-space: pre-wrap;
@@ -129,6 +134,20 @@
       <section class="result">
         <h2>Submitted Code</h2>
         <pre>{{ code | e }}</pre>
+      </section>
+      {% endif %}
+
+      {% if error %}
+      <section class="result error">
+        <h2>Error</h2>
+        <pre>{{ error }}</pre>
+      </section>
+      {% endif %}
+
+      {% if result %}
+      <section class="result">
+        <h2>Result</h2>
+        <pre>{{ result }}</pre>
       </section>
       {% endif %}
     </main>
