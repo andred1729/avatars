@@ -4,6 +4,9 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from talk import talk
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = FastAPI(title="Code Submission App")
 
