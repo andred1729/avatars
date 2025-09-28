@@ -148,8 +148,7 @@ def speech(
     api_key = os.getenv("ELEVENLABS_API_KEY")
     if not api_key:
         raise EnvironmentError("Set ELEVENLABS_API_KEY before calling speech().")
-
-    resolved_voice_id = voice_id or os.getenv("ELEVENLABS_VOICE_ID", "pqHfZKP75CvOlQylNhV4")
+    resolved_voice_id = "goT3UYdM9bhm0n2lmKQx"
 
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{resolved_voice_id}"
 
