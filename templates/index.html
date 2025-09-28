@@ -190,30 +190,6 @@
         height: 100%;
         touch-action: none;
       }
-
-      .whiteboard-spinner {
-        position: absolute;
-        top: 50%;
-        left: 50%;
-        width: 48px;
-        height: 48px;
-        margin: -24px 0 0 -24px;
-        border-radius: 50%;
-        border: 4px solid rgba(0, 0, 0, 0.2);
-        border-top-color: #1a1a1a;
-        animation: whiteboard-spin 0.9s linear infinite;
-        display: none;
-      }
-
-      .whiteboard-spinner.active {
-        display: block;
-      }
-
-      @keyframes whiteboard-spin {
-        to {
-          transform: rotate(360deg);
-        }
-      }
     </style>
   </head>
   <body>
@@ -256,11 +232,8 @@
         <span>Whiteboard</span>
         <button type="button" id="whiteboard-tool-toggle">Pen</button>
         <button type="button" id="whiteboard-clear">Clear</button>
-        <button type="button" id="whiteboard-send">Send to Herdora</button>
-        <button type="button" id="whiteboard-close">Close (Esc)</button>
       </div>
       <canvas class="whiteboard-canvas" id="whiteboard-canvas"></canvas>
-      <div class="whiteboard-spinner" id="whiteboard-spinner" aria-hidden="true"></div>
     </div>
     <script type="application/json" id="whiteboard-data">{{ whiteboard_state if whiteboard_state else '{}' }}</script>
     <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js" integrity="sha256-dGkEAjWz0nN7kYMva9n32CuWHa3gwxObn2ymlk/wr9g=" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
@@ -274,9 +247,6 @@
       const whiteboardCtx = whiteboardCanvas.getContext('2d');
       const whiteboardToolToggle = document.getElementById('whiteboard-tool-toggle');
       const whiteboardClearBtn = document.getElementById('whiteboard-clear');
-      const whiteboardSendBtn = document.getElementById('whiteboard-send');
-      const whiteboardCloseBtn = document.getElementById('whiteboard-close');
-      const whiteboardSpinner = document.getElementById('whiteboard-spinner');
       const whiteboardStateEl = document.getElementById('whiteboard-data');
 
       let whiteboardState = { strokes: [] };
@@ -321,14 +291,6 @@
         if (whiteboardActive) {
           resizeCanvas();
         }
-        if (!whiteboardActive) {
-          setSpinnerVisible(false);
-        }
-      }
-
-      function setSpinnerVisible(visible) {
-        whiteboardSpinner.classList.toggle('active', visible);
-        whiteboardSendBtn.disabled = Boolean(visible);
       }
 
       function setTool(tool) {
@@ -442,7 +404,7 @@
         }
 
         setVoiceStatus('Sending voice submission to Herdora...');
-        outputTextarea.value = 'Processing voice submission...';
+        outputTextarea.value = '';
 
         try {
           const response = await fetch('/submit/voice', {
@@ -682,43 +644,6 @@
       whiteboardClearBtn.addEventListener('click', () => {
         whiteboardCtx.clearRect(0, 0, whiteboardCanvas.width, whiteboardCanvas.height);
         clearWhiteboardOnServer();
-      });
-
-      whiteboardSendBtn.addEventListener('click', () => {
-        const defaultPrompt = 'Explain the current whiteboard.';
-        const promptText = window.prompt('What should Herdora do with the whiteboard?', defaultPrompt);
-        if (promptText === null) {
-          return;
-        }
-        outputTextarea.value = 'Sending whiteboard to Herdora...';
-        setSpinnerVisible(true);
-        fetch('/whiteboard/send', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({ prompt: promptText }),
-        })
-          .then((response) => response.json())
-          .then((data) => {
-            if (data && data.whiteboard) {
-              updateWhiteboardState(data.whiteboard);
-            }
-            if (data && data.talk && data.talk.text) {
-              outputTextarea.value = data.talk.text;
-            } else {
-              outputTextarea.value = 'Whiteboard sent, but no response text was returned.';
-            }
-            setSpinnerVisible(false);
-          })
-          .catch(() => {
-            outputTextarea.value = 'Failed to send the whiteboard to Herdora.';
-            setSpinnerVisible(false);
-          });
-      });
-
-      whiteboardCloseBtn.addEventListener('click', () => {
-        toggleWhiteboard(false);
       });
 
       window.addEventListener('resize', () => {
