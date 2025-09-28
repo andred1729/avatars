@@ -1,14 +1,13 @@
 """Herdora speech pipeline.
 
-Generates a sarcastic response via Herdora (OpenAI-compatible) or OpenAI,
-then vocalizes it with ElevenLabs.
+Generates a sarcastic response via OpenAI and vocalizes it with ElevenLabs.
 """
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Dict, Optional, List, Union
+from typing import Dict, Optional
 
 import requests
 
@@ -25,10 +24,6 @@ DEFAULT_VOICE_SETTINGS: Dict[str, float | bool] = {
     "use_speaker_boost": True,
 }
 
-# Herdora / OpenAI defaults
-DEFAULT_HERDORA_BASE_URL = os.getenv("HERDORA_BASE_URL", "https://pygmalion.herdora.com/v1")
-DEFAULT_HERDORA_MODEL = os.getenv("HERDORA_MODEL", "Qwen/Qwen3-VL-235B-A22B-Instruct")
-
 __all__ = ["talk"]
 
 
@@ -41,8 +36,7 @@ def _load_system_prompt() -> str:
         ) from exc
 
 
-def _build_messages(user_prompt: str, image_url: Optional[str] = None) -> List[dict]:
-    """Build OpenAI-style messages. If image_url is provided, make multimodal."""
+def _build_messages(user_prompt: str) -> list[dict[str, str]]:
     persona = _load_system_prompt()
     system_content = (
         f"{persona}\n\n"
@@ -50,66 +44,31 @@ def _build_messages(user_prompt: str, image_url: Optional[str] = None) -> List[d
         "Keep it under three sentences, weave in vocal cues like *sighs* or *mutters*, and end with "
         "a begrudging offer to assist."
     )
-
-    user_content: Union[str, List[dict]]
-    if image_url:
-        user_content = [
-            {"type": "text", "text": user_prompt},
-            {"type": "image_url", "image_url": {"url": image_url}},
-        ]
-    else:
-        user_content = user_prompt
-
     return [
         {"role": "system", "content": system_content},
-        {"role": "user", "content": user_content},
+        {"role": "user", "content": user_prompt},
     ]
 
 
-def _request_openai_completion(messages: List[dict]) -> str:
-    """Route to Herdora if HERDORA_API_KEY is set; otherwise use OpenAI.
-
-    Herdora path requires `openai>=1.0.0` (the `OpenAI` client import).
-    """
-    herdora_key = os.getenv("HERDORA_API_KEY")
-    if herdora_key:
-        # --- Herdora (OpenAI-compatible) path ---
-        try:
-            from openai import OpenAI  # type: ignore
-        except ImportError as exc:
-            raise ImportError(
-                "Herdora route requires `openai` >= 1.0.0. Install with `pip install -U openai`."
-            ) from exc
-
-        client = OpenAI(base_url=DEFAULT_HERDORA_BASE_URL, api_key=herdora_key)
-        model = DEFAULT_HERDORA_MODEL
-
-        resp = client.chat.completions.create(model=model, messages=messages)
-        return (resp.choices[0].message.content or "").strip()
-
-    # --- Fallback: regular OpenAI path (supports your previous envs) ---
+def _request_openai_completion(messages: list[dict[str, str]]) -> str:
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
-        raise EnvironmentError(
-            "Set HERDORA_API_KEY (preferred) or OPENAI_API_KEY before calling talk()."
-        )
+        raise EnvironmentError("Set OPENAI_API_KEY before calling talk().")
 
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-    # Prefer the modern client if available
     try:
         from openai import OpenAI  # type: ignore
 
         client = OpenAI(api_key=api_key)
-        resp = client.chat.completions.create(model=model, messages=messages)
-        return (resp.choices[0].message.content or "").strip()
+        response = client.chat.completions.create(model=model, messages=messages)
+        return (response.choices[0].message.content or "").strip()
     except ImportError:
-        # Legacy SDK fallback
         import openai  # type: ignore
 
         openai.api_key = api_key
-        resp = openai.ChatCompletion.create(model=model, messages=messages)
-        return (resp["choices"][0]["message"]["content"] or "").strip()
+        response = openai.ChatCompletion.create(model=model, messages=messages)
+        return (response["choices"][0]["message"]["content"] or "").strip()
 
 
 def _synthesize_speech(
@@ -123,8 +82,7 @@ def _synthesize_speech(
     if not api_key:
         raise EnvironmentError("Set ELEVENLABS_API_KEY before calling talk().")
 
-    # Hardcoded default Herdora voice; override via env if you like
-    voice_id = os.getenv("ELEVENLABS_VOICE_ID", "IKne3meq5aSn9XLyUdCD")
+    voice_id = "IKne3meq5aSn9XLyUdCD"
     if not voice_id:
         raise EnvironmentError(
             "Set ELEVENLABS_VOICE_ID to the ElevenLabs voice ID that best matches Herdora."
@@ -164,27 +122,16 @@ def _synthesize_speech(
 def talk(
     user_prompt: str = DEFAULT_USER_PROMPT,
     *,
-    image_url: Optional[str] = None,
     voice_settings: Optional[Dict[str, float | bool]] = None,
     output_dir: Optional[Path] = None,
     output_file: Optional[str] = None,
 ) -> Dict[str, object]:
-    """Generate Herdora's sarcastic take and voice it via ElevenLabs.
+    """Generate Herdora's sarcastic take and voice it via ElevenLabs."""
 
-    If HERDORA_API_KEY is set, calls the Herdora gateway (OpenAI-compatible).
-    Otherwise, uses standard OpenAI credentials.
-
-    Args:
-        user_prompt: Main user text prompt.
-        image_url: Optional URL for a vision-enabled prompt (multimodal).
-        voice_settings: Optional ElevenLabs voice overrides.
-        output_dir: Where to write the MP3 (defaults to HERDORA_OUTPUT_DIR or ./output).
-        output_file: MP3 filename (defaults to HERDORA_OUTPUT_FILE or 'herdora-latest.mp3').
-    """
-    messages = _build_messages(user_prompt, image_url=image_url)
+    messages = _build_messages(user_prompt)
     script = _request_openai_completion(messages)
     if not script:
-        raise RuntimeError("The model returned an empty reply for Herdora's script.")
+        raise RuntimeError("OpenAI returned an empty reply for Herdora's script.")
 
     path = _synthesize_speech(
         script,
